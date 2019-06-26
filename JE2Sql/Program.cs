@@ -2,193 +2,135 @@
 {
     using System;
     using System.Collections.Generic;
-    using System.Globalization;
     using System.Linq;
-    using System.Net.Http;
-    using System.Text.Json.Serialization;
-    using System.Text.RegularExpressions;
     using System.Threading.Tasks;
     using static System.Console;
 
-    public static class JE
+    static class Program
     {
-        public class Response
+        static string TryGet(this IReadOnlyList<string> source, int index)
+            => index < source.Count && !string.IsNullOrWhiteSpace(source[index]) ? source[index] : null;
+
+        static string Capitalize(this string value)
         {
-            public Menu Menu { get; set; }
+            var characters = value.ToCharArray();
+            if (characters.Length > 0)
+            {
+                characters[0] = char.ToUpper(characters[0]);
+            }
+            
+            return new string(characters);
         }
-
-        public class Id
-        {
-            [JsonPropertyName("Id")]
-            public int Value { get; set; }
-        }
-
-        public class Menu
-        {
-            public IReadOnlyList<Category> Categories { get; set; }
-
-            [JsonPropertyName("accessories")]
-            public IReadOnlyList<Accessory> Accessories { get; set; }
-
-            [JsonPropertyName("products")]
-            public IReadOnlyList<Product> Products { get; set; }
-        }
-
-        public class Category
-        {
-            public string Name { get; set; }
-
-            public IReadOnlyList<Item> Items { get; set; }
-        }
-
-        public class Item
-        {
-            public IReadOnlyList<Id> Products { get; set; }
-        }
-
-        public class Accessory
-        {
-            public int Id { get; set; }
-
-            public string Name { get; set; }
-
-            public decimal Price { get; set; }
-        }
-
-        public class Product
-        {
-            public int Id { get; set; }
-
-            public string Name { get; set; }
-
-            [JsonPropertyName("Desc")]
-            public string Description { get; set; }
-
-            [JsonPropertyName("Syn")]
-            public string Variation { get; set; }
-
-            public decimal Price { get; set; }
-        }
-    }
-
-    public static class Sql
-    {
-        public class Type
-        {
-            public Guid Id { get; set; }
-
-            public string Description { get; set; }
-
-            public ISet<int> JEProductIds { get; set; }
-        }
-
-        public class Ingredient
-        {
-            public Guid Id { get; set; }
-
-            public string Name { get; set; }
-            public decimal Price { get; set; }
-        }
-
-        public class FoodIngredient
-        {
-            public Guid FoodId { get; set; }
-            public Guid IngredientId { get; set; }
-        }
-
-        public class Food
-        {
-            public Guid Id { get; set; }
-            public Guid TypeId { get; set; }
-
-            public string Name { get; set; }
-            public decimal Price { get; set; }
-            public bool Visible { get; set; }
-            public IReadOnlyList<string> JEIngredientNames { get; set; }
-        }
-    }
-
-    class Program
-    {
-        static string ToSql(string value) => $"'{value.Replace("'", "''")}'";
-        static string ToSql(Guid value) => ToSql(value.ToString("D"));
-
-        static string ToSql(decimal value) => value.ToString("##.##", new NumberFormatInfo { NumberDecimalSeparator = "." });
-
-        static string ToSql(bool value) => value ? "true" : "false";
 
         static async Task<int> Main(string[] args)
         {
-            var http = new HttpClient
-            {
-                BaseAddress = new Uri("http://www.justeat.it")
-            };
+            var selection = args.TryGet(index: 0);
 
-
-            if (args.Length == 0 || string.IsNullOrWhiteSpace(args[0]))
+            if (selection == null)
             {
-                Error.WriteLine("Misssing parameter menuId or restaurant name.");
+                Error.WriteLine("Missing parameter menuId or restaurant name.");
                 return 1;
             }
 
-            var selection = args[0];
-            var menuId = int.TryParse(selection, out _) 
-                ? selection
-                : await GetMenuId(http, selection);
+            var excludedVariations = (args.TryGet(index: 1) ?? string.Empty)
+                .Split(separator: ',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .ToHashSet(StringComparer.InvariantCultureIgnoreCase);
 
-            if (string.IsNullOrEmpty(menuId))
+            using var api = new Api(new Uri("http://www.justeat.it"), ".\\cookies.bin");
+
+            var menuId = int.TryParse(selection, out var id)
+                ? id
+                : await api.TryGetMenuId(selection);
+
+            if (menuId == null)
             {
                 Error.WriteLine($"Could not find menu id for {selection}.");
                 return 2;
             }
-            
-            var stream = await http.GetStreamAsync($"/menu/getproductsformenu?menuId={menuId}");
 
-            var response = await JsonSerializer.ReadAsync<JE.Response>(stream);
+            var menu = await api.GetMenu(menuId.Value);
 
-            var menu = response.Menu;
+            var defaultType = new Sql.Type
+            {
+                Id = Guid.NewGuid(),
+                Description = "Unknown"
+            };
 
             var types = menu.Categories.Select(category => new Sql.Type
-            {
-                Id = Guid.NewGuid(),
-                Description = category.Name,
-                JEProductIds = category.Items.SelectMany(item => item.Products.Select(id => id.Value)).ToHashSet()
-            });
+                {
+                    Id = Guid.NewGuid(),
+                    Description = category.Name,
+                    JEProductIds = category.Items.SelectMany(item => item.Products.Select(id => id.Value)).ToHashSet()
+                })
+                .ToArray();
 
             var ingredients = menu.Accessories.Select(accessory => new Sql.Ingredient
-            {
-                Id = Guid.NewGuid(),
-                Name = accessory.Name,
-                Price = accessory.Price
-            });
-
-            var foods = menu.Products.Select(product => new Sql.Food
-            {
-                Id = Guid.NewGuid(),
-                Name = product.Name,
-                Visible = true,
-                Price = product.Price,
-                TypeId = types.First(type => type.JEProductIds.Contains(product.Id)).Id,
-                JEIngredientNames = product.Description.Split(new[] { ",", " e " }, StringSplitOptions.RemoveEmptyEntries).Select(name => name.Trim()).ToArray()
-            });
-
-            var foodIngredients = foods.SelectMany(food =>
-            {
-                var matching = food.JEIngredientNames
-                    .SelectMany(name => ingredients.Where(ingredient => string.Equals(ingredient.Name, name, StringComparison.InvariantCultureIgnoreCase)).Take(count: 1));
-
-                return matching.Select(ingredient => new Sql.FoodIngredient
                 {
-                    FoodId = food.Id,
-                    IngredientId = ingredient.Id
-                });
-            });
+                    Id = Guid.NewGuid(),
+                    Name = accessory.Name,
+                    Price = accessory.Price
+                })
+                .ToList();
+
+            var foods = menu.Products
+                .Where(product => !excludedVariations.Contains(product.Variation?.Trim()))
+                .GroupBy(product => product.Name.Trim())
+                .SelectMany(g => g.Select(product =>
+                {
+                    var variation = g.Count() > 1 && !string.IsNullOrEmpty(product.Variation)
+                        ? $" ({product.Variation})"
+                        : string.Empty;
+
+                    return new Sql.Food
+                    {
+                        Id = Guid.NewGuid(),
+                        Name = $"{g.Key}{variation}",
+                        Visible = true,
+                        Price = product.Price,
+                        TypeId = (types.FirstOrDefault(type => type.JEProductIds.Contains(product.Id)) ?? defaultType).Id,
+                        JEIngredientNames = (product.Description ?? "").Split(new[] { ",", " e " }, StringSplitOptions.RemoveEmptyEntries).Select(name => name.Trim()).ToArray()
+                    };
+                }))
+                .ToArray();
+            
+            var foodIngredients = new List<Sql.FoodIngredient>();
+            foreach (var food in foods)
+            {
+                foreach (var name in food.JEIngredientNames)
+                {
+                    var match = ingredients.FirstOrDefault(ingredient => string.Equals(ingredient.Name, name, StringComparison.InvariantCultureIgnoreCase));
+                    if (match == null)
+                    {
+                        match = new Sql.Ingredient
+                        {
+                            Id = Guid.NewGuid(),
+                            Name = name.Capitalize(),
+                            Price = -1
+                        };
+
+                        ingredients.Add(match);
+                    }
+                    
+                    foodIngredients.Add(new Sql.FoodIngredient
+                    {
+                        FoodId = food.Id,
+                        IngredientId = match.Id
+                    });
+                }
+            }
+            
 
             WriteLine("// type");
 
             foreach (var type in types)
             {
-                WriteLine($"insert into type (id, description) values ({ToSql(type.Id)}, {type.Description});");
+                WriteLine(type.Render());
+            }
+
+            if (foods.Any(food => food.TypeId == defaultType.Id))
+            {
+                WriteLine(defaultType.Render());
             }
 
             WriteLine();
@@ -196,7 +138,7 @@
 
             foreach (var ingredient in ingredients)
             {
-                WriteLine($"insert into ingredient (id, name, price) values ({ToSql(ingredient.Id)}, {ToSql(ingredient.Name)}, {ToSql(ingredient.Price)});");
+                WriteLine(ingredient.Render());
             }
 
             WriteLine();
@@ -204,7 +146,7 @@
 
             foreach (var food in foods)
             {
-                WriteLine($"insert into food (id, name, price, type, visible) values ({ToSql(food.Id)}, {ToSql(food.Name)}, {ToSql(food.Price)}, {ToSql(food.TypeId)}, {ToSql(food.Visible)});");
+                WriteLine(food.Render());
             }
 
             WriteLine();
@@ -212,30 +154,10 @@
 
             foreach (var foodIngredient in foodIngredients)
             {
-                WriteLine($"insert into food_ingredient (food, ingredient) values ({foodIngredient.FoodId}, {foodIngredient.IngredientId});");
+                WriteLine(foodIngredient.Render());
             }
 
             return 0;
-        }
-
-        static async Task<string> GetMenuId(HttpClient http, string restaurant)
-        {
-            var request = new HttpRequestMessage(HttpMethod.Get, new Uri($"/restaurants-{restaurant}", UriKind.Relative))
-            {
-                Headers =
-                {
-                    { "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36" },
-                },
-            };
-
-            var page = await http.SendAsync(request);
-            if (!page.IsSuccessStatusCode)
-            {
-                return null;
-            }
-
-            var regex = new Regex("JustEatData.MenuId = '(.+)';");
-            return regex.Match(await page.Content.ReadAsStringAsync()).Groups[1].Value;
         }
     }
 }
